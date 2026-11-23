@@ -1,0 +1,114 @@
+#!/system/bin/sh
+# DSH Root Bridge — 持久会话 shell（“模拟终端执行”的核心）
+#
+# 由 service.sh 以真 root 拉起，一个会话一个常驻进程。命令在**同一个** shell
+# 里 eval，所以 cd / export / 变量 / 函数 / 别名在两次调用之间都保留，和坐在
+# 真终端前连续敲命令一致。和 dshroot 的一次性队列互补：
+#
+#   dshroot 'cmd'   → 独立进程，干净但无状态
+#   dshtty  'cmd'   → 常驻 shell，有状态（cd / env）
+#
+# 数据面（都在 0700 会话目录里，属主是 App 的 uid）：
+#   in.<id>    客户端投递的命令（原子 mv 进来）
+#   out.<id>   输出（stdout+stderr 合并）
+#   rc.<id>    退出码；它出现就代表这条命令执行完了
+#   .pwd       当前目录，每次执行后刷新，给客户端画提示符
+#   .beat      心跳（1 秒 1 次），客户端据此判断会话是否还活着
+#   .pid       本进程 pid，service.sh 据此避免重复拉起
+#   .quit      客户端写它 = 请求结束会话
+#   .dead      shell 退出后留下，客户端与 service.sh 都看它
+#
+# 用法: term-shell.sh <会话目录> <APPUID>
+set -u
+
+S=${1:-}
+APPUID=${2:-0}
+[ -n "$S" ] || exit 2
+
+umask 077
+LOG=$S/.log
+
+own() { [ -e "$1" ] && { chown "$APPUID" "$1" 2>/dev/null; chmod "${2:-600}" "$1" 2>/dev/null; }; }
+log() { echo "$(date '+%F %T') $$ $*" >> "$LOG" 2>/dev/null; own "$LOG" 600; }
+
+# 单实例：同一个会话只允许一个 shell。用 .pid 当唯一真相，比自己发明的锁文件
+# 少一类竞态：老实例正在退场时 .pid 已经不在了，新实例可以立刻接手。
+mkdir -p "$S" 2>/dev/null
+chown "$APPUID" "$S" 2>/dev/null
+old=$(cat "$S/.pid" 2>/dev/null)
+if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then exit 0; fi
+
+rm -f "$S/.dead" "$S/.quit" 2>/dev/null
+echo $$ > "$S/.pid" 2>/dev/null
+own "$S/.pid" 600
+own "$S" 700
+
+# 只有仍然持有 .pid 的实例才写 .dead / 清 .pid，晚退场的老实例不会把新会话标记
+# 成"已结束"（否则客户端会误判并中断正在执行的命令）。
+finish() {
+  cur=$(cat "$S/.pid" 2>/dev/null)
+  if [ -z "$cur" ] || [ "$cur" = "$$" ]; then
+    rm -f "$S/.pid" 2>/dev/null
+    date +%s > "$S/.dead" 2>/dev/null
+    own "$S/.dead" 600
+  fi
+  log "exit"
+}
+trap finish EXIT
+
+log "start"
+# 起点和 root shell 一样落在 /data；用户 cd 到哪就停在哪
+cd /data 2>/dev/null || cd /
+echo "$PWD" > "$S/.pwd" 2>/dev/null; own "$S/.pwd" 600
+date +%s > "$S/.beat" 2>/dev/null; own "$S/.beat" 600
+last_beat=$(date +%s)
+last_used=$last_beat
+
+while :; do
+  [ -f "$S/.quit" ] && { log "quit"; break; }
+
+  now=$(date +%s)
+  if [ "$now" != "$last_beat" ]; then
+    date +%s > "$S/.beat.new" 2>/dev/null; own "$S/.beat.new" 600
+    mv -f "$S/.beat.new" "$S/.beat" 2>/dev/null   # 原子替换，读端不会读到空
+    last_beat=$now
+  fi
+
+  cmd_file=""
+  for c in "$S"/in.*; do
+    [ -f "$c" ] && { cmd_file=$c; break; }
+  done
+
+  if [ -z "$cmd_file" ]; then
+    # 闲置 10 分钟就自己退出：不用的会话不该留一个 root shell 在内存里
+    if [ $((now - last_used)) -gt 600 ]; then
+      log "idle exit"
+      break
+    fi
+    sleep 0.12
+    continue
+  fi
+
+  id=${cmd_file##*/in.}
+  # 抢下这条命令，抢不到说明另一个进程先拿了
+  mv "$cmd_file" "$S/.run.$id" 2>/dev/null || { rm -f "$cmd_file" 2>/dev/null; continue; }
+  cmd=$(cat "$S/.run.$id" 2>/dev/null)
+  rm -f "$S/.run.$id" 2>/dev/null
+
+  if [ -z "$cmd" ]; then
+    : > "$S/out.$id" 2>/dev/null; own "$S/out.$id" 600
+    echo 0 > "$S/rc.$id" 2>/dev/null; own "$S/rc.$id" 600
+    continue
+  fi
+
+  last_used=$(date +%s)
+  log "run $id"
+  # stdin 接 /dev/null：会话没有 tty，遇到 cat/read 也不会把整条会话挂死
+  eval "$cmd" < /dev/null > "$S/.o.$id" 2>&1
+  rc=$?
+
+  pwd > "$S/.pwd" 2>/dev/null; own "$S/.pwd" 600
+  mv -f "$S/.o.$id" "$S/out.$id" 2>/dev/null
+  own "$S/out.$id" 600
+  echo "$rc" > "$S/rc.$id" 2>/dev/null; own "$S/rc.$id" 600
+done

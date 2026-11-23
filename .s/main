@@ -1,0 +1,465 @@
+#!/system/bin/sh
+# DSH Bridge — the daemon behind the module's service.sh entry point.
+#
+# Why a second file: managers require the entry to be named service.sh, and the
+# visible cmdline of a running process is its script path. exec'ing into this
+# hidden file keeps "root" out of every process name a scanner could match.
+#
+# 1) serves exactly one client (the dsh-go app) through its own private storage
+# 2) drops the matching skill, `dshroot` and `dshtty` into the app's rootfs
+#    (re-checks every 30 s, so an app runtime reset heals by itself)
+# 3) keeps on demand a pool of long-lived shells for `dshtty` sessions
+# 4) backs off to a slow poll when idle: nothing to observe while nobody asks
+# 5) writes a status file and a log to /data/local/tmp so a broken bridge can be
+#    diagnosed (and restarted) from the manager's action button / WebUI without
+#    any working root channel
+
+APP=${DSH_RB_APP:-io.github.ccch1mneyyy.dsh_app}
+ROOTFS=${DSH_RB_ROOTFS:-/data/data/$APP/files/runtime/rootfs}
+DIR=${DSH_RB_DIR:-$ROOTFS/root/.dsh/bus}
+LOG=$ROOTFS/root/.dsh/bus.log
+SESS_ROOT=$DIR/.sess
+
+# 并发：一条长命令不该堵死别人。上限可调，默认 4。
+MAXJOBS=${DSH_RB_MAXJOBS:-4}
+JOB_TIMEOUT=${DSH_RB_JOB_TIMEOUT:-900}
+
+# 诊断面：/data/local/tmp 是 shell 可读的，管理器 WebUI / action.sh 靠它看状态。
+SYSLOG=${DSH_RB_SYSLOG:-/data/local/tmp/dsh_bridge.log}
+STATUS=${DSH_RB_STATUS:-/data/local/tmp/dsh_bridge.status}
+
+# this file lives in <module>/.s/, so the module root is one level up
+SELFDIR=${0%/*}
+[ "$SELFDIR" = "$0" ] && SELFDIR=.
+case "$SELFDIR" in
+  .s)   MODDIR=. ;;
+  */.s) MODDIR=${SELFDIR%/.s} ;;
+  *)    MODDIR=$SELFDIR ;;
+esac
+SKILL_SRC=$MODDIR/skill/SKILL.md
+HELPER_SRC=$MODDIR/bin/dshroot
+TTY_SRC=$MODDIR/bin/dshtty
+SHELL_SRC=$MODDIR/.s/sess
+ASSET_VERSION=$(cat "$MODDIR/asset_version" 2>/dev/null || echo 1)
+
+# The lock lives next to the queue so that an install-time launch and the
+# boot-time launch contend for the same mutex even though the module dir changes
+# between them.
+#
+# 但绝不能在 App 的运行时还没解包时就把队列目录建出来：开机时守护进程比 App
+# 先跑，以 root 在 App 私有目录里造 rootfs/root/.dsh 会让 App 之后重建运行时
+# 撞上 root 属主的目录，表现就是"重启后桥和 App 一起不对劲"。等 App 先建。
+if [ -d "$ROOTFS/root" ] || [ -d "$ROOTFS" ]; then
+  mkdir -p "$DIR" 2>/dev/null
+fi
+if [ -d "$DIR" ]; then
+  LOCK=$DIR/.daemon.lock
+  PIDFILE=$DIR/.daemon.pid
+else
+  LOCK=$MODDIR/.daemon.lock
+  PIDFILE=$MODDIR/.daemon.pid
+fi
+
+umask 077
+
+# Root 进程不该被 LMK 优先回收：桥断了，客户端没有任何办法自己叫回 root。
+echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+
+LOG_LINES=0
+log() {
+  msg="$(date '+%F %T') $*"
+  echo "$msg" >> "$LOG" 2>/dev/null
+  echo "$msg" >> "$SYSLOG" 2>/dev/null
+  LOG_LINES=$((LOG_LINES + 1))
+  if [ $((LOG_LINES % 200)) -eq 0 ]; then
+    tail -n 400 "$SYSLOG" > "$SYSLOG.tmp" 2>/dev/null && mv -f "$SYSLOG.tmp" "$SYSLOG" 2>/dev/null
+  fi
+}
+
+MANAGER=unknown
+[ -d /data/adb/magisk ] && MANAGER=Magisk
+[ -d /data/adb/ksu ] && MANAGER=KernelSU
+[ -d /data/adb/ap ] && MANAGER=APatch
+
+APPUID=""
+ASSETS_STATE="init"
+LOOPS=0
+
+count_files() { ls -1 "$DIR"/$1 2>/dev/null | wc -l | tr -d ' '; }
+
+# 给管理器 / action.sh / WebUI 看的一份人类可读快照。原子替换，读端不会读到半截。
+write_status() {
+  [ -d "${STATUS%/*}" ] || return 0
+  {
+    echo "ts=$(date +%s)"
+    echo "pid=$$"
+    echo "manager=$MANAGER"
+    echo "appuid=$APPUID"
+    echo "dir=$DIR"
+    echo "loop=$LOOPS"
+    echo "assets=$ASSETS_STATE"
+    echo "jobs=$(count_files '.job.*')"
+    echo "queued=$(count_files 'req.*')"
+    echo "unfetched=$(count_files 'out.*')"
+  } > "$STATUS.tmp" 2>/dev/null || return 0
+  chmod 644 "$STATUS.tmp" 2>/dev/null
+  mv -f "$STATUS.tmp" "$STATUS" 2>/dev/null
+}
+
+count_jobs() { ls -1 "$DIR"/.job.* 2>/dev/null | wc -l | tr -d ' '; }
+
+# 原子发布心跳：先写 .alive.new 再 mv，读端不会撞上半截文件。
+# 属主必须是 App，否则 0600 的root 文件客户端读不到，等于没心跳。
+beat() {
+  [ -d "$DIR" ] || return 0
+  date +%s > "$DIR/.alive.new" 2>/dev/null || return 0
+  chown "$APPUID" "$DIR/.alive.new" 2>/dev/null
+  chmod 600 "$DIR/.alive.new" 2>/dev/null
+  mv -f "$DIR/.alive.new" "$DIR/.alive" 2>/dev/null
+}
+
+# 一条请求的完整生命周期，在独立子进程里跑：主循环继续服务心跳、
+# 新请求和会话创建，互不阻塞。
+run_request() {
+  rid=$1
+  rcmd=$2
+  rtmp="$DIR/.tmp.$rid"
+  timeout "$JOB_TIMEOUT" /system/bin/sh -c "$rcmd" > "$rtmp" 2>&1
+  rrc=$?
+  { echo "$rrc"; base64 "$rtmp" 2>/dev/null | tr -d '\n'; } > "$DIR/out.$rid.new" 2>/dev/null
+  chown "$APPUID" "$DIR/out.$rid.new" 2>/dev/null
+  chmod 600 "$DIR/out.$rid.new" 2>/dev/null
+  mv -f "$DIR/out.$rid.new" "$DIR/out.$rid" 2>/dev/null
+  rm -f "$rtmp" "$DIR/.job.$rid" 2>/dev/null
+  log "done $rid rc=$rrc"
+}
+
+# cmdline of a pid, NULs flattened, for matching without ps quirks across toybox
+# versions.
+pid_cmdline() {
+  # 进程可能在扫描途中消失；用 cat 让"打不开"也落到 stderr 归零
+  cat "/proc/$1/cmdline" 2>/dev/null | tr '\0' ' '
+}
+
+# A pid is only the daemon if its cmdline says so. Across a reboot the pid in a
+# leftover lock file (or in /data/local/tmp) is very likely reused by some other
+# process — treating it as "already running" would leave the bridge dead until
+# the user reinstalls. Always verify the cmdline, not just kill -0.
+is_daemon_pid() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  c=$(cat "/proc/$1/cmdline" 2>/dev/null | tr '\0' ' ')
+  case "$c" in *".s/main"*) return 0 ;; esac
+  return 1
+}
+
+# Single instance, taken with mkdir: the install-time launch and the boot-time
+# launch can arrive milliseconds apart, and if both serve the queue one request
+# gets executed twice. A pid file alone loses that race (both read "no file").
+if ! mkdir "$LOCK" 2>/dev/null; then
+  # 刚拿到锁的实例可能还没来得及写 pid，先等一会儿再判定"陈旧"，
+  # 否则会把一个活锁误删成自己的。
+  old=""
+  i=0
+  while [ $i -lt 15 ]; do
+    old=$(cat "$LOCK/pid" 2>/dev/null)
+    [ -n "$old" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    if is_daemon_pid "$old"; then
+      log "already running pid=$old (this pid=$$), exit"
+      # 75 = 有活实例在服务；supervisor 见到这个码就安静等，不会反复重拉。
+      exit 75
+    fi
+    log "lock pid=$old is some other process now (pid reuse), taking over"
+  fi
+  log "stale lock held by pid=${old:-?}, taking over"
+  rm -rf "$LOCK" 2>/dev/null
+  mkdir "$LOCK" 2>/dev/null || { log "lock busy (this pid=$$), exit"; exit 75; }
+fi
+echo $$ > "$LOCK/pid" 2>/dev/null
+echo $$ > "$PIDFILE" 2>/dev/null
+
+# 写入后再核对一次：极窄的窗口里可能被别人接手
+sleep 0.2
+cur=$(cat "$LOCK/pid" 2>/dev/null)
+if [ "$cur" != "$$" ]; then
+  log "lost the lock to pid=${cur:-?} (this pid=$$), exit"
+  exit 75
+fi
+
+# Upgrading from a release that predates the pid file leaves an unsupervised
+# daemon holding the queue. Retire it (and its terminal shells) so the new code
+# is the only one serving: otherwise a one-shot request could be executed twice.
+# 收集自己的祖先链：安装器 / action.sh 可能刚好在命令行里带着模块路径，
+# 不能把"启动我们的人"当成旧实例杀掉。
+is_ancestor() {
+  p=$$
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ]; do
+    [ "$p" = "$1" ] && return 0
+    p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+  done
+  return 1
+}
+
+retire_older_instances() {
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ "$pid" = "$$" ] && continue
+    is_ancestor "$pid" && continue
+    cmd=$(pid_cmdline "$pid")
+    # `sh -c '...'` 形式的父进程（安装器、action.sh 的调用者）不是旧实例
+    case "$cmd" in *" -c "*) continue ;; esac
+    case "$cmd" in
+      *"$MODDIR/.s/main"*|*"$MODDIR/service.sh"*|*"$MODDIR/.s/sess"*|\
+      *"$MODDIR/bin/term-shell.sh"*|\
+      *dsh_root_bridge/service.sh*|*dsh_root_bridge*/bin/term-shell.sh*|\
+      *dsh_bridge/service.sh*|*dsh_bridge/.s/main*|*dsh_bridge/.s/sess*)
+        log "retire old instance pid=$pid"
+        kill -TERM "$pid" 2>/dev/null
+        ;;
+    esac
+  done
+}
+retire_older_instances
+
+cleanup() {
+  rm -rf "$LOCK" 2>/dev/null
+  rm -f "$PIDFILE" 2>/dev/null
+  rm -rf "$DIR/.daemon.lock" "$DIR/.daemon.pid" 2>/dev/null
+  log "daemon exit pid=$$"
+}
+# TERM/INT/HUP 也要走到 cleanup：否则锁留给下个实例判"陈旧"，
+# 白等一轮才接管。
+trap cleanup EXIT
+trap 'exit 0' TERM INT HUP
+
+APPUID=""
+i=0
+# 最多等 10 秒。以前是 30 秒，冷启动时客户端/action.sh 早就等超时了，
+# 看起来就是"启动无效"——先点亮心跳比先知道 uid 重要。
+while [ $i -lt 20 ]; do
+  APPUID=$(stat -c %u "/data/data/$APP" 2>/dev/null)
+  [ -n "$APPUID" ] && break
+  i=$((i + 1))
+  sleep 0.5
+done
+[ -z "$APPUID" ] && APPUID=$(stat -c %u "$ROOTFS" 2>/dev/null)
+[ -z "$APPUID" ] && APPUID=10409
+
+# 日志也要让 App 身份读得到，否则 dshroot --status 只能干瞪眼
+chown "$APPUID" "$LOG" 2>/dev/null
+chmod 600 "$LOG" 2>/dev/null
+
+# 队列目录必须是 App 的 uid 所有，否则客户端（App 身份）写不进请求。
+# 但只有 App 的运行时已经存在时才建：开机时守护进程比 App 先跑，以 root 身份
+# 造 rootfs/root/.dsh 会让 App 之后解包运行时撞上 root 属主目录。
+if [ -d "$ROOTFS/root" ] || [ -d "$ROOTFS" ]; then
+  mkdir -p "$DIR" 2>/dev/null
+  chown "$APPUID" "$DIR" 2>/dev/null
+  chmod 700 "$DIR" 2>/dev/null
+fi
+
+# 启动时 DIR 可能还不存在（App 还没解包运行时），那时锁落在模块目录里。
+# 之后 DIR 出现，就把 pid 镜像进去：否则 action.sh 在 $DIR/.daemon.lock 里
+# 永远找不到 pid，状态一直显示"没有在运行"，重启按钮看着像没生效。
+mirror_pid() {
+  [ -d "$DIR" ] || return 0
+  if [ "$LOCK" = "$DIR/.daemon.lock" ]; then return 0; fi
+  mkdir -p "$DIR/.daemon.lock" 2>/dev/null
+  echo $$ > "$DIR/.daemon.lock/pid" 2>/dev/null
+  chmod 700 "$DIR/.daemon.lock" 2>/dev/null
+  chmod 600 "$DIR/.daemon.lock/pid" 2>/dev/null
+  echo $$ > "$DIR/.daemon.pid" 2>/dev/null
+  return 0
+}
+
+# Idempotent: installs on first boot, re-installs if the app reset its runtime.
+sync_assets() {
+  [ -d "$ROOTFS/root" ] || { ASSETS_STATE="no-rootfs"; return 0; }
+
+  st=""
+
+  d="$ROOTFS/root/.dsh/skills/dsh-root"
+  if [ -f "$SKILL_SRC" ]; then
+    if [ ! -f "$d/SKILL.md" ] || [ "$(cat "$d/.version" 2>/dev/null)" != "$ASSET_VERSION" ]; then
+      mkdir -p "$d" 2>/dev/null
+      cp -f "$SKILL_SRC" "$d/SKILL.md" 2>/dev/null && echo "$ASSET_VERSION" > "$d/.version" 2>/dev/null
+      chown -R "$APPUID" "$d" 2>/dev/null
+      chmod 700 "$d" 2>/dev/null
+      chmod 600 "$d/SKILL.md" "$d/.version" 2>/dev/null
+      log "skill synced"
+    fi
+    st="$st skill:$([ -f "$d/SKILL.md" ] && echo ok || echo fail)"
+  else
+    st="$st skill:missing-src"
+  fi
+
+  for pair in "$HELPER_SRC:dshroot" "$TTY_SRC:dshtty"; do
+    src=${pair%%:*}
+    name=${pair##*:}
+    h="$ROOTFS/usr/local/bin/$name"
+    if [ ! -f "$src" ]; then
+      st="$st $name:missing-src"
+      continue
+    fi
+    if [ ! -f "$h" ] || [ "$(cat "$ROOTFS/usr/local/bin/.$name.version" 2>/dev/null)" != "$ASSET_VERSION" ]; then
+      mkdir -p "${h%/*}" 2>/dev/null
+      cp -f "$src" "$h" 2>/dev/null
+      echo "$ASSET_VERSION" > "$ROOTFS/usr/local/bin/.$name.version" 2>/dev/null
+      chown "$APPUID" "$h" "$ROOTFS/usr/local/bin/.$name.version" 2>/dev/null
+      chmod 755 "$h" 2>/dev/null
+      chmod 600 "$ROOTFS/usr/local/bin/.$name.version" 2>/dev/null
+      log "helper synced ($name)"
+    fi
+    st="$st $name:$([ -x "$h" ] && echo ok || echo fail)"
+  done
+
+  ASSETS_STATE="${st# }"
+}
+
+# One long-lived shell per session directory. The client creates the directory
+# and drops .start; we launch the shell as root, term-shell.sh keeps the state.
+start_sessions() {
+  STARTED=0
+  [ -d "$SESS_ROOT" ] || return 0
+  for s in "$SESS_ROOT"/*; do
+    [ -d "$s" ] || continue
+    p=$(cat "$s/.pid" 2>/dev/null)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && continue
+    [ -f "$s/.start" ] || continue
+    rm -f "$s/.start" "$s/.dead" 2>/dev/null
+    [ -f "$SHELL_SRC" ] || { log "term-shell missing: $SHELL_SRC"; continue; }
+    log "term start ${s##*/}"
+    STARTED=1
+    ( setsid /system/bin/sh "$SHELL_SRC" "$s" "$APPUID" >/dev/null 2>&1 & ) 2>/dev/null \
+      || ( nohup /system/bin/sh "$SHELL_SRC" "$s" "$APPUID" >/dev/null 2>&1 & ) 2>/dev/null
+  done
+  return 0
+}
+
+# Sessions whose shell is gone and that nobody touched for 10 minutes go away.
+prune_sessions() {
+  [ -d "$SESS_ROOT" ] || return 0
+  now=$(date +%s)
+  for s in "$SESS_ROOT"/*; do
+    [ -d "$s" ] || continue
+    p=$(cat "$s/.pid" 2>/dev/null)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && continue
+    b=$(cat "$s/.beat" 2>/dev/null)
+    case "$b" in ''|*[!0-9]*) b=0 ;; esac
+    [ $((now - b)) -gt 600 ] && rm -rf "$s" 2>/dev/null
+  done
+  return 0
+}
+
+# 上一次守护进程被杀时，正在跑的作业来不及清理自己的标记，启动时统一收掉
+rm -f "$DIR"/.job.* "$DIR"/.tmp.* 2>/dev/null
+
+log "start manager=$MANAGER appuid=$APPUID dir=$DIR pid=$$"
+mirror_pid
+# 先把心跳点亮，再做资产同步：restart / action.sh 的等待逻辑看的是心跳，
+# 没人愿意等 cp 完才算"活"。
+beat
+sync_assets
+write_status
+
+LAST_SYNC=$(date +%s)
+idle=0
+while true; do
+  work=0
+  # App uninstalled or data wiped: never recreate its private tree ourselves.
+  if [ ! -d "/data/data/$APP" ]; then
+    sleep 10
+    continue
+  fi
+
+  LOOPS=$((LOOPS + 1))
+  now=$(date +%s)
+
+  # 每 30 秒核对一次资产：App 升级 / 重置运行时会清掉 rootfs，只有这里
+  # 能把它补回来，否则 dshroot 消失就表现为"root 丢了"。
+  if [ $((now - LAST_SYNC)) -ge 30 ]; then
+    sync_assets
+    LAST_SYNC=$now
+    write_status
+  fi
+
+  [ $((LOOPS % 50)) -eq 0 ] && prune_sessions
+  [ $((LOOPS % 300)) -eq 0 ] && log "alive loop=$LOOPS jobs=$(count_files '.job.*') queued=$(count_files 'req.*')"
+
+  start_sessions
+  [ "${STARTED:-0}" = "1" ] && work=1
+
+  if [ ! -d "$DIR" ]; then
+    # App 还没解包运行时（开机早期、或刚清过数据）：不要替它造目录，
+    # 否则 root 属主的 rootfs/root 会挡住 App 自己解包。
+    if [ -d "$ROOTFS/root" ] || [ -d "$ROOTFS" ]; then
+      mkdir -p "$DIR" 2>/dev/null
+      chown "$APPUID" "$DIR" 2>/dev/null
+      chmod 700 "$DIR" 2>/dev/null
+      mirror_pid
+      # 运行时被重置过：资产多半也没了，下一轮立刻补
+      LAST_SYNC=0
+      continue
+    fi
+    [ $((LOOPS % 60)) -eq 0 ] && log "waiting for runtime: $ROOTFS"
+    sleep 2
+    continue
+  fi
+
+  # 客户端（App 身份，没有 root）重连入口：写 .reconnect 让守护进程自己退场，
+  # supervisor 会在 3 秒内用新进程重新接手。这样"重连"不需要任何 root 权限。
+  if [ -f "$DIR/.reconnect" ]; then
+    rm -f "$DIR/.reconnect" 2>/dev/null
+    log "reconnect requested by client"
+    exit 76
+  fi
+
+  for f in "$DIR"/req.*; do
+    [ -f "$f" ] || continue
+
+    owner=$(stat -c %u "$f" 2>/dev/null)
+    if [ "$owner" != "$APPUID" ]; then
+      log "reject foreign request ${f##*/} owner=$owner"
+      rm -f "$f" 2>/dev/null
+      continue
+    fi
+
+    # 并发满了就先不取，下一轮再看：心跳和会话创建照常
+    [ "$(count_jobs)" -ge "$MAXJOBS" ] && break
+
+    id=${f##*/req.}
+    cmd=$(base64 -d "$f" 2>/dev/null)
+    rm -f "$f" 2>/dev/null
+    [ -z "$cmd" ] && { log "empty request $id"; continue; }
+
+    : > "$DIR/.job.$id" 2>/dev/null
+    chown "$APPUID" "$DIR/.job.$id" 2>/dev/null
+    chmod 600 "$DIR/.job.$id" 2>/dev/null
+    log "run $id"
+    run_request "$id" "$cmd" &
+    work=1
+  done
+
+  # Results nobody collected, and requests that never got picked up, expire.
+  beat
+
+  [ $((LOOPS % 10)) -eq 0 ] && write_status
+
+  find "$DIR" -maxdepth 1 -name 'out.*' -mmin +10 -exec rm -f {} + 2>/dev/null
+  find "$DIR" -maxdepth 1 -name 'req.*' -mmin +10 -exec rm -f {} + 2>/dev/null
+  find "$DIR" -maxdepth 1 -name '.job.*' -mmin +30 -exec rm -f {} + 2>/dev/null
+  find "$DIR" -maxdepth 1 -name '.tmp.*' -mmin +30 -exec rm -f {} + 2>/dev/null
+
+  # 空闲退避：没人用的时候把轮询降到 2 秒，有事立刻回到 0.2 秒。
+  # 心跳照写，客户端仍能判定存活。
+  if [ "$work" = "1" ]; then
+    idle=0
+  else
+    idle=$((idle + 1))
+    [ "$idle" -gt 40 ] && idle=40
+  fi
+  if [ "$idle" -gt 25 ]; then sleep 2; else sleep 0.2; fi
+done

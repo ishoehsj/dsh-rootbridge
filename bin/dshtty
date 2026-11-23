@@ -1,0 +1,298 @@
+#!/bin/sh
+# dshtty — 通过 DSH Root Bridge 开一个持久的 root 终端会话。
+#
+# 和 dshroot 的区别：dshroot 每条命令一个独立进程，cd 会丢；dshtty 背后是一个
+# 常驻的 root shell，`cd`、`export`、变量、函数在多次调用之间都保留。
+#
+#   dshtty                    进交互终端
+#   dshtty -c 'cd /data/adb'  执行一次，状态对后面的调用仍然有效
+#   dshtty ls / kill / status 管理会话
+#
+# 会话数据面在 $DIR/.sess/<名字>/，由模块的 service.sh 以 root 拉起 term-shell.sh。
+set -u
+
+DIR="${DSH_ROOT_BRIDGE_DIR:-${DSH_HOME:-$HOME/.dsh}/bus}"
+SESS_ROOT="$DIR/.sess"
+SID="${DSH_TTY_SESSION:-default}"
+TIMEOUT_MS="${DSH_TTY_TIMEOUT_MS:-600000}"
+
+die() { echo "$*" >&2; exit 2; }
+
+usage() {
+  cat >&2 <<'EOF'
+用法:
+  dshtty                    交互终端（有 tty 逐行执行；无 tty 从 stdin 读脚本）
+  dshtty -c '命令'          执行一次并返回退出码，cd / export 会保留
+
+注意：**这不是 PTY**，只保留 shell 状态（cwd/env/变量）。`tty` 会回答 not a tty，
+调用 isatty() 的交互式程序需要喂输入，例：
+  dshtty -c '( sleep 2; echo 1; sleep 2; echo 1 ) | /data/local/tmp/loader' 
+  dshtty ls                 列出会话
+  dshtty kill [名字]        结束会话
+  dshtty reset              结束并重建当前会话
+  dshtty status             桥与会话的状态
+  dshtty --raw '命令'       不走会话，用一次性队列（等同 dshroot）
+
+环境变量: DSH_TTY_SESSION=会话名   DSH_TTY_TIMEOUT_MS=超时毫秒
+
+例:
+  dshtty -c 'cd /data/adb/modules && pwd'
+  dshtty -c 'export FOO=1; echo $FOO'
+  DSH_TTY_SESSION=work dshtty -c 'top -n 1 | head'
+EOF
+}
+
+valid_name() {
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# .beat 同样是"截断+写"，单次读可能读到空；连读几次再判死活。
+beat_age() {
+  i=0
+  b=""
+  while [ $i -lt 6 ]; do
+    b=$(cat "$SESS_ROOT/$SID/.beat" 2>/dev/null) || b=""
+    [ -n "$b" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  case "$b" in ''|*[!0-9]*) echo -1; return ;; esac
+  echo $(( $(date +%s) - b ))
+}
+
+sess_alive() {
+  [ -f "$SESS_ROOT/$SID/.pid" ] || return 1
+  a=$(beat_age)
+  [ "$a" -ge 0 ] && [ "$a" -le 8 ]
+}
+
+ensure_session() {
+  valid_name "$SID" || die "会话名只能含字母数字 . _ -：$SID"
+  s="$SESS_ROOT/$SID"
+  if [ ! -d "$DIR" ]; then
+    echo "root 桥没就绪：$DIR 不存在（模块没装或没重启）" >&2
+    return 3
+  fi
+  mkdir -p "$s" 2>/dev/null || die "建不了会话目录：$s"
+  sess_alive && return 0
+
+  if [ -f "$s/.dead" ]; then
+    echo "上一个会话已结束，重开一个（原来的 cd / 变量都没了）" >&2
+  fi
+  rm -f "$s/.dead" "$s/.quit" 2>/dev/null
+  : > "$s/.start" 2>/dev/null || die "写不了启动标记：$s/.start"
+
+  i=0
+  while [ $i -lt 80 ]; do
+    sess_alive && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  echo "会话没起来。" >&2
+  echo "  dshroot --status   # 看模块的桥还在不在" >&2
+  echo "  dshtty --raw id    # 退回一次性通道自查" >&2
+  return 3
+}
+
+new_id() {
+  n=$(date +%s%N 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) n=$(date +%s) ;; esac
+  id="$n-$$"
+  k=0
+  while [ -e "$SESS_ROOT/$SID/in.$id" ] || [ -e "$SESS_ROOT/$SID/rc.$id" ]; do
+    k=$((k + 1))
+    id="$n-$$-$k"
+  done
+  echo "$id"
+}
+
+send() {
+  s="$SESS_ROOT/$SID"
+  id=$(new_id)
+  printf '%s' "$1" > "$s/.in.$id" 2>/dev/null || { echo "写命令失败：$s" >&2; return 1; }
+  mv -f "$s/.in.$id" "$s/in.$id" 2>/dev/null || { echo "投递命令失败：$s" >&2; return 1; }
+
+  limit=$(( TIMEOUT_MS / 100 ))
+  [ "$limit" -lt 1 ] && limit=1
+  i=0
+  while [ $i -lt $limit ]; do
+    [ -f "$s/rc.$id" ] && break
+    if ! sess_alive; then
+      if [ -f "$s/rc.$id" ]; then break; fi
+      echo "会话已结束（之前在里面执行过 exit？重开：dshtty reset）" >&2
+      rm -f "$s/in.$id" 2>/dev/null
+      return 5
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  if [ ! -f "$s/rc.$id" ]; then
+    echo "超时：${TIMEOUT_MS}ms 内没有响应（长任务用 nohup 丢后台，或调大 DSH_TTY_TIMEOUT_MS）" >&2
+    rm -f "$s/in.$id" 2>/dev/null
+    return 5
+  fi
+
+  cat "$s/out.$id" 2>/dev/null
+  rc=$(cat "$s/rc.$id" 2>/dev/null); rc=${rc:-0}
+  case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
+  rm -f "$s/out.$id" "$s/rc.$id" 2>/dev/null
+  return "$rc"
+}
+
+repl() {
+  buf=""
+  last=""
+  echo "root 终端会话 [$SID]，exit 或 Ctrl-D 退出（会话保留，下次接着用）" >&2
+  while :; do
+    cwd=$(cat "$SESS_ROOT/$SID/.pwd" 2>/dev/null)
+    [ -n "$cwd" ] || cwd=/
+    printf 'root@%s:%s # ' "$SID" "$cwd" >&2
+
+    if ! IFS= read -r line; then
+      echo "" >&2
+      break
+    fi
+
+    if [ -n "$buf" ]; then
+      buf="$buf
+$line"
+    else
+      buf=$line
+    fi
+
+    # 行尾反斜杠 = 续行
+    case "$buf" in
+      *\\) buf="${buf%\\}"; continue ;;
+    esac
+
+    cmd=$buf
+    buf=""
+    case "$cmd" in
+      ''|'#'*) continue ;;
+      exit|quit|logout|':q') break ;;
+      '!!') [ -n "$last" ] || { echo "还没有上一条命令" >&2; continue; }; cmd=$last ;;
+    esac
+
+    last=$cmd
+    send "$cmd"
+    rc=$?
+    [ "$rc" = 0 ] || echo "  [exit $rc]" >&2
+  done
+}
+
+script_mode() {
+  while IFS= read -r line; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    send "$line"
+    rc=$?
+    [ "$rc" = 0 ] || echo "  [exit $rc]  ← $line" >&2
+  done
+}
+
+list_sessions() {
+  if [ ! -d "$SESS_ROOT" ]; then
+    echo "还没有会话（$SESS_ROOT 不存在）"
+    return 0
+  fi
+  n=0
+  for s in "$SESS_ROOT"/*; do
+    [ -d "$s" ] || continue
+    name=${s##*/}
+    b=$(cat "$s/.beat" 2>/dev/null); case "$b" in ''|*[!0-9]*) b=0 ;; esac
+    age=$(( $(date +%s) - b ))
+    if [ -f "$s/.pid" ] && [ "$age" -le 8 ]; then st="运行中"; else st="已结束"; fi
+    pwdv=$(cat "$s/.pwd" 2>/dev/null)
+    printf '%-12s %-6s 心跳 %-6ss cwd %s\n' "$name" "$st" "$age" "${pwdv:-?}"
+    n=$((n + 1))
+  done
+  [ "$n" = 0 ] && echo "还没有会话"
+  return 0
+}
+
+kill_session() {
+  name=${1:-$SID}
+  valid_name "$name" || die "会话名只能含字母数字 . _ -：$name"
+  s="$SESS_ROOT/$name"
+  [ -d "$s" ] || die "没有这个会话：$name"
+  : > "$s/.quit" 2>/dev/null
+  i=0
+  while [ $i -lt 40 ]; do
+    [ -f "$s/.dead" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -f "$s/.dead" ]; then
+    echo "会话已结束：$name"
+  else
+    echo "已请求结束：$name（可能还卡在一条命令里，稍等会自己退）"
+  fi
+  return 0
+}
+
+bridge_status() {
+  if [ ! -d "$DIR" ]; then
+    echo "root 桥：目录不存在（$DIR）"
+    return 3
+  fi
+  beat=$(cat "$DIR/.alive" 2>/dev/null)
+  if [ -z "$beat" ]; then
+    echo "root 桥：没有心跳文件（模块的 service.sh 没跑过）"
+  else
+    age=$(( $(date +%s) - beat ))
+    if [ "$age" -le 20 ]; then
+      echo "root 桥：运行中（心跳 ${age}s 前）"
+    else
+      echo "root 桥：无响应（心跳停在 ${age}s 前 → 重启手机或重装模块）"
+    fi
+  fi
+  log="${DIR%/*}/bus.log"
+  [ -f "$log" ] && { echo "日志尾："; tail -n 3 "$log" | sed 's/^/  /'; }
+  return 0
+}
+
+case "${1:-}" in
+  '')
+    ensure_session || exit 3
+    if [ -t 0 ]; then repl; else script_mode; fi
+    exit 0
+    ;;
+  -h|--help|help) usage; exit 0 ;;
+  -c)
+    shift
+    [ $# -ge 1 ] || die "用法: dshtty -c '命令'"
+    ensure_session || exit 3
+    send "$*"
+    exit $?
+    ;;
+  --raw)
+    shift
+    [ $# -ge 1 ] || die "用法: dshtty --raw '命令'"
+    exec dshroot "$*"
+    ;;
+  ls|list) list_sessions ;;
+  kill|stop) shift; kill_session "${1:-$SID}" ;;
+  reset)
+    if [ -d "$SESS_ROOT/$SID" ]; then kill_session "$SID" >/dev/null 2>&1; rm -rf "$SESS_ROOT/$SID"; fi
+    ensure_session || exit 3
+    echo "会话已重建：$SID"
+    ;;
+  status)
+    bridge_status
+    echo ""
+    echo "会话："
+    list_sessions
+    ;;
+  -*) die "不认识的选项：$1" ;;
+  *)
+    ensure_session || exit 3
+    send "$*"
+    exit $?
+    ;;
+esac

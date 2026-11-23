@@ -1,0 +1,6 @@
+{
+  "version": "v1.9.0",
+  "versionCode": 16,
+  "zipUrl": "https://raw.githubusercontent.com/ishoehsj/dsh-rootbridge/main/dist/dsh-rootbridge-v1.9.0.zip",
+  "changelog": "v1.9.0：只有 pid 不算活，必须心跳新鲜；按 cmdline 匹配杀进程；启动后核对真实心跳。dshroot 一次性 + dshtty 持久会话，supervisor 自愈，不挂载 system。"
+}

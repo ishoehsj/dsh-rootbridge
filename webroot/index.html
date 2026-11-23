@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>DSH Bridge</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0; padding: 16px 14px 28px;
+      background: #0f172a; color: #e2e8f0;
+      font: 15px/1.6 system-ui, -apple-system, "Noto Sans SC", sans-serif;
+    }
+    h1 { margin: 0 0 2px; font-size: 19px; letter-spacing: .2px; }
+    .sub { margin: 0 0 14px; color: #94a3b8; font-size: 13px; }
+    .card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 14px;
+      padding: 12px 14px; margin-bottom: 12px;
+    }
+    .state { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #64748b; flex: none; }
+    .dot.ok { background: #22c55e; box-shadow: 0 0 8px #22c55e88; }
+    .dot.bad { background: #ef4444; box-shadow: 0 0 8px #ef444488; }
+    .dot.warn { background: #f59e0b; box-shadow: 0 0 8px #f59e0b88; }
+    .meta { margin-top: 6px; color: #94a3b8; font-size: 12.5px; word-break: break-all; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button {
+      flex: 1 1 0; min-width: 84px; padding: 11px 10px;
+      border-radius: 11px; border: 1px solid #334155;
+      background: #243449; color: #e2e8f0; font-size: 14px; font-weight: 600;
+    }
+    button:active { background: #2f4560; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.danger { background: #3b1d24; border-color: #7f1d1d; color: #fca5a5; }
+    button[disabled] { opacity: .5; }
+    pre {
+      margin: 0; padding: 12px; border-radius: 12px; background: #111c2e;
+      border: 1px solid #263449; color: #cbd5e1;
+      font: 12px/1.55 ui-monospace, "SF Mono", Menlo, monospace;
+      white-space: pre-wrap; word-break: break-all;
+      max-height: 44vh; overflow: auto;
+    }
+    .tip { color: #94a3b8; font-size: 12.5px; margin-top: 10px; }
+    .hdr { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+    .hdr span { color: #94a3b8; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>DSH Bridge</h1>
+  <p class="sub">给 dsh-go 的 root 通道：这里的按钮以 root 启停守护进程</p>
+
+  <div class="card">
+    <div class="state"><span id="dot" class="dot"></span><span id="state">读取中…</span></div>
+    <div id="meta" class="meta"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="primary" data-act="start">启动</button>
+      <button data-act="restart">重连</button>
+      <button class="danger" data-act="stop">停止</button>
+      <button data-act="doctor">诊断</button>
+    </div>
+    <div class="tip">
+      「重连」= 杀掉守护进程 → 清锁 → 重新拉起 → 等心跳。守护进程被系统杀掉、
+      或活着但心跳停了，都点这个；不用重启手机。
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hdr"><b>操作输出</b><span id="actline">还没有操作</span></div>
+    <pre id="out">等待操作…</pre>
+  </div>
+
+  <div class="card">
+    <div class="hdr"><b>状态</b><span id="statusline"></span></div>
+    <pre id="status">读取中…</pre>
+  </div>
+
+  <script>
+    // v1.9.0: 三种管理器/接口形态都要能跑
+    //   1. 现在 KernelSU / WebUI-Next：ksu.exec(cmd, JSON字符串, 回调函数名)
+    //   2. 部分实现直接返回 Promise / {errno,stdout,stderr}
+    //   3. 没有 ksu（APatch 的网页、浏览器直接打开）：明确告诉用户走模块卡片
+    const MOD = '/data/adb/modules/dsh_bridge';
+    const $ = (id) => document.getElementById(id);
+
+    function hasKsu() {
+      return typeof globalThis.ksu !== 'undefined' && typeof globalThis.ksu.exec === 'function';
+    }
+
+    // 关键：以前这里只认回调，回调不来就永远卡在「执行中…」，看起来就是"按钮无效"。
+    // 现在加超时 + Promise 兜底，失败一定给出可执行下一步。
+    function exec(cmd, timeoutMs) {
+      const limit = timeoutMs || 30000;
+      return new Promise((resolve, reject) => {
+        if (!hasKsu()) {
+          reject(new Error('这个页面需要在 KernelSU / APatch 管理器里打开（模块卡片 → 打开）'));
+          return;
+        }
+        const cb = 'dsh_cb_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
+        let settled = false;
+        let timer = null;
+
+        const done = (errno, stdout, stderr) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          delete window[cb];
+          resolve({ errno: errno, stdout: stdout || '', stderr: stderr || '' });
+        };
+
+        window[cb] = done;
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          delete window[cb];
+          reject(new Error('管理器 ' + Math.round(limit / 1000) + ' 秒没有回调。这只是页面拿不到结果，命令本身可能已经跑了：点「刷新状态」，或去模块卡片 → 执行。'));
+        }, limit);
+
+        try {
+          const r = globalThis.ksu.exec(cmd, JSON.stringify({ cwd: '/' }), cb);
+          if (r && typeof r.then === 'function') {
+            r.then((v) => done(v && v.errno, v && v.stdout, v && v.stderr)).catch((e) => {
+              if (settled) return;
+              settled = true; clearTimeout(timer); delete window[cb];
+              reject(e);
+            });
+          } else if (r && typeof r === 'object' && 'errno' in r) {
+            done(r.errno, r.stdout, r.stderr);
+          }
+        } catch (e) {
+          if (settled) return;
+          settled = true; clearTimeout(timer); delete window[cb];
+          reject(e);
+        }
+      });
+    }
+
+    function render(state, meta) {
+      const dot = $('dot');
+      dot.className = 'dot ' + (state === 'ok' ? 'ok' : state === 'hung' ? 'warn' : state === 'bad' ? 'bad' : '');
+      $('state').textContent =
+        state === 'ok' ? '桥在运行' : state === 'hung' ? '守护进程在，但心跳停了' : state === 'bad' ? '桥没在运行' : '读取中…';
+      $('meta').textContent = meta || '';
+    }
+
+    let busy = false;
+
+    async function refresh() {
+      if (busy) return;
+      $('statusline').textContent = '刷新中…';
+      try {
+        const r = await exec('sh ' + MOD + '/action.sh status', 20000);
+        const text = (r.stdout || r.stderr || '').trim();
+        $('status').textContent = text;
+        const running = /状态：运行中/.test(text);
+        const hung = /心跳异常/.test(text);
+        const pidm = text.match(/pid=(\d+)/);
+        const beat = text.match(/心跳 (\d+)s/);
+        render(
+          running ? 'ok' : hung ? 'hung' : 'bad',
+          [
+            pidm ? 'pid ' + pidm[1] : '',
+            beat ? '心跳 ' + beat[1] + 's 前' : '',
+            hasKsu() ? '' : '没有 WebUI 接口'
+          ].filter(Boolean).join(' · ')
+        );
+        $('statusline').textContent = new Date().toLocaleTimeString();
+      } catch (e) {
+        render('bad', String(e.message || e));
+        $('status').textContent = String(e.message || e);
+        $('statusline').textContent = '失败';
+      }
+    }
+
+    async function act(name) {
+      if (busy) return;
+      busy = true;
+      const btns = document.querySelectorAll('button');
+      btns.forEach((b) => (b.disabled = true));
+      $('state').textContent = '执行中…';
+      $('actline').textContent = name + ' · 运行中';
+      // 动作输出单独一个框：以前它和定时刷新共用 #out，5 秒内就被状态覆盖，
+      // 用户看不到任何结果，只能得出"重启无效"的结论。
+      $('out').textContent = '正在执行：action.sh ' + name + '\n（重启要杀进程 + 等心跳，最多约 40 秒）';
+      try {
+        const r = await exec('sh ' + MOD + '/action.sh ' + name, 90000);
+        const body = ((r.stdout || '') + (r.stderr ? '\n' + r.stderr : '')).trim();
+        $('out').textContent = body || '（没有输出：退出码 ' + r.errno + '）';
+        $('actline').textContent = name + ' · ' + new Date().toLocaleTimeString() + ' · 退出码 ' + r.errno;
+      } catch (e) {
+        $('out').textContent = String(e.message || e) +
+          '\n\n可以改用：模块卡片 → 执行（等价 action.sh auto）';
+        $('actline').textContent = name + ' · 失败';
+      } finally {
+        busy = false;
+        btns.forEach((b) => (b.disabled = false));
+        refresh();
+      }
+    }
+
+    document.querySelectorAll('button[data-act]').forEach((b) => {
+      b.addEventListener('click', () => act(b.dataset.act));
+    });
+
+    refresh();
+    setInterval(refresh, 8000);
+    if (!hasKsu()) {
+      render('bad', '没有 WebUI 接口');
+      $('out').textContent = '这个页面没有拿到 ksu 接口：请从 KernelSU / APatch 管理器的模块卡片「打开」进入。';
+    }
+  </script>
+</body>
+</html>

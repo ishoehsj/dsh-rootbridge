@@ -1,0 +1,270 @@
+#!/bin/bash
+# dshroot — 通过 DSH Bridge 模块，以真 root 身份执行一条命令。
+# 桥是一对目录：请求写 req.<id>，结果读 out.<id>（首行是退出码，其余是 base64 的输出）。
+set -u
+
+DIR="${DSH_ROOT_BRIDGE_DIR:-${DSH_HOME:-$HOME/.dsh}/bus}"
+LOG="${DIR%/*}/bus.log"
+TIMEOUT_MS="${DSH_ROOT_TIMEOUT_MS:-180000}"
+APP_PKG="${DSH_APP_PKG:-io.github.ccch1mneyyy.dsh_app}"
+ROOTFS_HOST="/data/data/$APP_PKG/files/runtime/rootfs"
+
+usage() {
+  cat >&2 <<'EOF'
+用法: dshroot <命令>            执行并等待结果（默认等 180 秒）
+      dshroot --status          桥状态：心跳、执行中/排队/未领取、日志
+      dshroot --queue           列出没人领取的结果（客户端超时后留下的）
+      dshroot --fetch <id>      取回一条结果并删除
+      dshroot --clean           清掉 10 分钟以上的未领取结果
+      dshroot --cancel          清掉自己还在排队的请求（已在执行的不受影响）
+      dshroot --reconnect       让守护进程换一个干净进程（App 身份即可，不需要 root）
+
+例:   dshroot id
+      dshroot 'pm disable-user --user 0 <包名>'
+      dshroot 'nohup sh /data/local/tmp/job.sh >/tmp/job.log 2>&1 &'
+
+长任务建议 nohup 丢后台，别占着队列；DSH_ROOT_TIMEOUT_MS 可调等待时间。
+EOF
+}
+
+# 守护进程写 .alive 是"截断+写"，读的瞬间可能读到空文件（实测 ~4%）。连读几次
+# 再下结论，避免把活着的桥误判成掉线。
+read_beat() {
+  i=0
+  b=""
+  while [ $i -lt 6 ]; do
+    b=$(cat "$DIR/.alive" 2>/dev/null)
+    [ -n "$b" ] && { echo "$b"; return 0; }
+    sleep 0.05
+    i=$((i + 1))
+  done
+  echo ""
+}
+
+beat_age() {
+  beat=$(read_beat)
+  now=$(date +%s)
+  if [ -z "$beat" ]; then
+    echo "-1"
+  else
+    echo $((now - beat))
+  fi
+}
+
+# 容器路径 → 宿主路径，两套命名空间一起给，省得自己换算
+host_path() {
+  case "${1:-}" in
+    /root/*) echo "$ROOTFS_HOST$1" ;;
+    *) echo "（容器内路径，宿主同名不存在）" ;;
+  esac
+}
+
+count_glob() {
+  ls -1 "$DIR"/$1 2>/dev/null | wc -l | tr -d ' '
+}
+
+print_heartbeat() {
+  age=$(beat_age)
+  if [ "$age" -ge 0 ] && [ "$age" -le 20 ]; then
+    echo "桥：运行中（心跳 ${age}s 前）"
+    return 0
+  fi
+
+  # 心跳不对时给出分层原因，别一句"模块没装"把人带偏
+  if [ "$age" -lt 0 ]; then
+    echo "桥：目录在，但没有心跳文件"
+    echo "  → 模块的 service.sh 从没跑过：重装模块，或重启一次手机"
+    echo "    已在 KernelSU 里装过的话：模块卡片 → 执行（action.sh），或在模块 WebUI 点「启动」"
+    return 3
+  fi
+
+  echo "桥：无响应（心跳停在 ${age}s 前）"
+  lockpid=$(cat "$DIR/.daemon.lock/pid" 2>/dev/null)
+  if [ -n "$lockpid" ] && [ -d "/proc/$lockpid" ]; then
+    echo "  → 守护进程 pid=$lockpid 还在，但不再更新心跳"
+    echo "    常见原因：被内核模块/LSM 拦截、进程卡死、系统挂起后没恢复"
+    echo "    自检：看 /proc/$lockpid/status 是否可读，或重启手机"
+  elif [ -n "$lockpid" ]; then
+    echo "  → 守护进程 pid=$lockpid 已不存在（锁是陈旧的），通常是它被系统杀掉了"
+    echo "    处理：模块卡片 → 执行（action.sh start），或模块 WebUI 点「启动」；不必重启手机"
+  else
+    echo "  → 没有任何守护进程登记（锁文件缺失或不可读）"
+    echo "    处理：模块卡片 → 执行（action.sh start），或在模块 WebUI 点「启动」"
+  fi
+  return 3
+}
+
+show_log_tail() {
+  if [ ! -f "$LOG" ]; then
+    echo "日志：${LOG/#$HOME/~} 不存在"
+    return 0
+  fi
+  if [ ! -r "$LOG" ]; then
+    # 典型是 SELinux 标签或属主问题：说明情况，别让人以为桥挂了
+    echo "日志：${LOG/#$HOME/~} 存在但当前身份读不到（属主/标签问题），心跳与队列计数仍然有效"
+    return 0
+  fi
+  echo "日志尾："
+  tail -n 6 "$LOG" | sed 's/^/  /'
+}
+
+do_status() {
+  if [ ! -d "$DIR" ]; then
+    echo "桥目录不存在：$DIR"
+    echo "宿主：$(host_path "$DIR")"
+    echo "→ 模块没装，或 App 数据被清过"
+    exit 3
+  fi
+  print_heartbeat
+  echo "容器路径：$DIR"
+  echo "宿主路径：$(host_path "$DIR")"
+  echo "队列：执行中 $(count_glob '.job.*') · 排队 $(count_glob 'req.*') · 未领取 $(count_glob 'out.*')"
+  show_log_tail
+}
+
+do_queue() {
+  [ -d "$DIR" ] || { echo "桥目录不存在：$DIR" >&2; exit 3; }
+  n=0
+  for f in "$DIR"/out.*; do
+    [ -f "$f" ] || continue
+    id=${f##*/out.}
+    rc=$(head -n 1 "$f" 2>/dev/null)
+    first=$(tail -n +2 "$f" 2>/dev/null | base64 -d 2>/dev/null | head -n 1 | cut -c1-80)
+    printf '%-24s rc=%-4s %s\n' "$id" "${rc:-?}" "${first}"
+    n=$((n + 1))
+  done
+  [ "$n" = 0 ] && echo "没有未领取的结果" || echo "共 $n 条；取回：dshroot --fetch <id>"
+}
+
+do_fetch() {
+  id=${1:-}
+  [ -n "$id" ] || { echo "用法: dshroot --fetch <id>（用 --queue 看 id）" >&2; exit 2; }
+  res="$DIR/out.$id"
+  [ -f "$res" ] || { echo "没有这条结果：$id" >&2; exit 2; }
+  code=$(head -n 1 "$res" 2>/dev/null)
+  body=$(tail -n +2 "$res" 2>/dev/null)
+  rm -f "$res"
+  [ -n "$body" ] && printf '%s' "$body" | base64 -d 2>/dev/null
+  case "$code" in ''|*[!0-9]*) echo "结果文件损坏（首行不是退出码）" >&2; exit 1 ;; esac
+  exit "$code"
+}
+
+do_clean() {
+  [ -d "$DIR" ] || { echo "桥目录不存在：$DIR" >&2; exit 3; }
+  n=$(find "$DIR" -maxdepth 1 -name 'out.*' -mmin +10 2>/dev/null | wc -l | tr -d ' ')
+  find "$DIR" -maxdepth 1 -name 'out.*' -mmin +10 -exec rm -f {} + 2>/dev/null
+  echo "已清理 $n 条超过 10 分钟的未领取结果"
+}
+
+do_reconnect() {
+  [ -d "$DIR" ] || { echo "桥目录不存在：$DIR" >&2; exit 3; }
+  target=$(( $(date +%s) + 1 ))
+  : > "$DIR/.reconnect" 2>/dev/null || { echo "写不进 $DIR（权限问题？）" >&2; exit 4; }
+
+  t=0
+  while [ "$t" -lt 60 ]; do
+    sleep 0.5
+    t=$((t + 1))
+    b=$(read_beat)
+    case "$b" in ''|*[!0-9]*) continue ;; esac
+    [ "$b" -ge "$target" ] || continue
+    a=$(( $(date +%s) - b ))
+    [ "$a" -le 5 ] && { echo "已重连：新心跳 ${a}s 前"; exit 0; }
+  done
+
+  echo "重连请求已发出，但 30 秒内没等到新心跳。" >&2
+  echo "守护进程多半已经不在了，root 通道没法自救：" >&2
+  echo "  KernelSU → 模块卡片 → 执行（等于 action.sh），或 sh /data/adb/modules/dsh_bridge/action.sh restart" >&2
+  exit 5
+}
+
+do_cancel() {
+  [ -d "$DIR" ] || { echo "桥目录不存在：$DIR" >&2; exit 3; }
+  n=0
+  for f in "$DIR"/req.*; do
+    [ -f "$f" ] || continue
+    rm -f "$f" 2>/dev/null && n=$((n + 1))
+  done
+  echo "已取消 $n 条排队中的请求（正在执行的不会被中断）"
+}
+
+case "${1:-}" in
+  '') usage; exit 2 ;;
+  -h|--help|help) usage; exit 0 ;;
+  --status|-s) do_status; [ $? = 0 ] && exit 0 || exit 3 ;;
+  --queue|-q) do_queue; exit 0 ;;
+  --fetch) shift; do_fetch "${1:-}" ;;
+  --clean) do_clean; exit 0 ;;
+  --cancel) do_cancel; exit 0 ;;
+  --reconnect|-r) do_reconnect ;;
+esac
+
+if [ ! -d "$DIR" ]; then
+  echo "桥未就绪：$DIR 不存在（模块没装，或还没重启过）" >&2
+  exit 3
+fi
+
+print_heartbeat >/tmp/.dsh_hb.$$ 2>/dev/null || true
+age=$(beat_age)
+if [ "$age" -lt 0 ] || [ "$age" -gt 20 ]; then
+  print_heartbeat >&2
+  rm -f "/tmp/.dsh_hb.$$"
+  exit 3
+fi
+rm -f "/tmp/.dsh_hb.$$"
+
+# id 要唯一：随机段取不到时退回纳秒，仍然撞车就往后加序号
+make_id() {
+  r=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n')
+  [ -n "$r" ] || r=$(date +%s%N 2>/dev/null)
+  [ -n "$r" ] || r=0
+  cand="$$.$r"
+  k=0
+  while [ -e "$DIR/out.$cand" ] || [ -e "$DIR/req.$cand" ]; do
+    k=$((k + 1))
+    cand="$$.$r$k"
+  done
+  echo "$cand"
+}
+
+id=$(make_id)
+req="$DIR/req.$id"
+res="$DIR/out.$id"
+
+printf '%s' "$*" | base64 | tr -d '\n' > "$req" || { echo "写入请求失败（桥目录不可写？看 dshroot --status）" >&2; exit 4; }
+
+limit=$(( TIMEOUT_MS / 100 ))
+[ "$limit" -lt 1 ] && limit=1
+n=0
+while [ "$n" -lt "$limit" ]; do
+  [ -s "$res" ] && break
+  sleep 0.1
+  n=$((n + 1))
+done
+
+if [ ! -s "$res" ]; then
+  # 明确区分"还在排队"和"已经在执行"，并且绝不假装成功
+  if [ -f "$req" ]; then
+    rm -f "$req"
+    echo "超时（${TIMEOUT_MS}ms）：请求还在排队，已撤回。用 dshroot --status 看队列。" >&2
+  else
+    echo "超时（${TIMEOUT_MS}ms）：请求已被领走、可能仍在执行。结果稍后会落在队列里：" >&2
+    echo "  dshroot --queue        # 列出来" >&2
+    echo "  dshroot --fetch $id    # 直接取回这条" >&2
+  fi
+  exit 5
+fi
+
+code=$(head -n 1 "$res" 2>/dev/null)
+body=$(tail -n +2 "$res" 2>/dev/null)
+rm -f "$res"
+
+case "$code" in
+  ''|*[!0-9]*)
+    echo "结果文件损坏：首行不是退出码（id=$id），结果可能被截断" >&2
+    exit 1
+    ;;
+esac
+
+[ -n "$body" ] && printf '%s' "$body" | base64 -d 2>/dev/null
+exit "$code"

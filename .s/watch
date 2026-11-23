@@ -1,0 +1,147 @@
+#!/system/bin/sh
+# Supervisor for the bridge daemon.
+#
+# Why this file exists: the daemon is a plain shell loop owned by nobody. If the
+# system (LMK, a manager update, a reboot race) kills it, nothing brings it back
+# and dsh-go silently loses root — which is exactly the "搭桥失败" symptom.
+# .s/watch is the parent process: it restarts .s/main whenever it exits, with
+# backoff so a permanent failure cannot burn the battery.
+#
+# It also stays in its own session (see service.sh) and asks the kernel not to
+# pick it for OOM kills: without the bridge, the client side has no way to ask
+# for root at all.
+
+SELFDIR=${0%/*}
+[ "$SELFDIR" = "$0" ] && SELFDIR=.
+case "$SELFDIR" in
+  .s)   MODDIR=. ;;
+  */.s) MODDIR=${SELFDIR%/.s} ;;
+  *)    MODDIR=$SELFDIR ;;
+esac
+[ -f "$MODDIR/.s/main" ] || MODDIR=/data/adb/modules/dsh_bridge
+
+MAIN=$MODDIR/.s/main
+SYSLOG=/data/local/tmp/dsh_bridge.log
+WPIDF=/data/local/tmp/dsh_bridge.watch.pid
+
+# -1000: never reap the only path to root. Best effort, silently ignored when
+# the kernel refuses (some custom kernels clamp this for app-spawned trees).
+echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+
+wlog() { echo "$(date '+%F %T') supervisor: $*" >> "$SYSLOG" 2>/dev/null; }
+
+# Exactly one supervisor. Two of them would each restart their own daemon and
+# the two would keep retiring each other — root works for a second, then dies.
+#
+# The check is done by scanning cmdlines instead of trusting a pid file: pids
+# are reused across reboots, and an upgrade moves the module to a new directory
+# (so a lock file inside the module cannot see the previous supervisor).
+mkdir -p /data/local/tmp 2>/dev/null
+found=""
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  [ "$pid" = "$$" ] && continue
+  c=$(cat "$d/cmdline" 2>/dev/null | tr '\0' ' ')
+  case "$c" in *" -c "*) continue ;; esac
+  case "$c" in
+    *".s/watch"*)
+      # 只认"模块目录还在"的那个 supervisor：升级后旧目录被删掉时，
+      # 它的 .s/main 已经不存在，把它当成活的会永久挡住新实例。
+      sp=$(echo "$c" | awk '{print $2}')
+      od=${sp%/.s/watch}
+      [ -n "$od" ] && [ "$od" != "$sp" ] && [ -f "$od/.s/main" ] && found=$pid
+      ;;
+  esac
+done
+if [ -n "$found" ]; then
+  wlog "supervisor pid=$found already running, exit (this pid=$$)"
+  exit 0
+fi
+
+LOCKDIR=$MODDIR/.supervisor.lock
+[ "${DSH_RB_FORCE:-0}" = "1" ] && rm -rf "$LOCKDIR" 2>/dev/null
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  # 刚拿到锁的实例可能还没写 pid：等一小会儿再判"陈旧"，否则两个
+  # supervisor 会互相删锁、互相拉守护进程。
+  old=""
+  i=0
+  while [ $i -lt 15 ]; do
+    old=$(cat "$LOCKDIR/pid" 2>/dev/null)
+    [ -n "$old" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    oldcmd=$(cat "/proc/$old/cmdline" 2>/dev/null | tr '\0' ' ')
+    case "$oldcmd" in
+      *".s/watch"*)
+        wlog "lock held by live supervisor pid=$old, exit (this pid=$$)"
+        exit 0
+        ;;
+    esac
+  fi
+  wlog "stale supervisor lock ($LOCKDIR), taking over"
+  rm -rf "$LOCKDIR" 2>/dev/null
+  got=0
+  for _ in 1 2 3; do
+    mkdir "$LOCKDIR" 2>/dev/null && { got=1; break; }
+    sleep 0.3
+    rm -rf "$LOCKDIR" 2>/dev/null
+  done
+  # 拿不到 supervisor 锁不再直接退出：真正的去重是守护进程自己的队列锁，
+  # 这里退出会让"模块装好了但桥永远起不来"，比多一个 supervisor 糟得多。
+  [ "$got" = "1" ] || wlog "supervisor lock unavailable ($LOCKDIR), continuing anyway"
+fi
+echo $$ > "$LOCKDIR/pid" 2>/dev/null
+echo $$ > "$WPIDF" 2>/dev/null
+trap 'rm -rf "$LOCKDIR" 2>/dev/null; rm -f "$WPIDF" 2>/dev/null' EXIT
+
+wlog "up pid=$$ moddir=$MODDIR"
+
+fails=0
+while :; do
+  start=$(date +%s)
+  /system/bin/sh "$MAIN"
+  rc=$?
+  end=$(date +%s)
+  dur=$((end - start))
+
+  # .s/main exits 75 when another live instance already owns the queue. That is
+  # the normal case when an install-time launch overlapped the boot-time one,
+  # so wait quietly instead of respawning in a tight loop.
+  if [ "$rc" = 75 ]; then
+    sleep 15
+    continue
+  fi
+
+  # 76 = 客户端写了 .reconnect，要求换一个干净的守护进程（无 root 也能触发）。
+  # 立刻重拉，且不计入"快速退出"的退避计数。
+  if [ "$rc" = 76 ]; then
+    wlog "daemon asked for a reconnect, respawning"
+    sleep 1
+    continue
+  fi
+
+  # 模块目录被安装器挪走/删掉时，脚本已经不存在了：127 的紧密循环只会烧电，
+  # 改成低频重试并明确记日志（此时需要重装或 action.sh start）。
+  if [ "$rc" = 127 ] || [ ! -f "$MAIN" ]; then
+    wlog "daemon script missing: $MAIN (waiting for reinstall)"
+    sleep 30
+    continue
+  fi
+
+  # A daemon that dies in under 3 s is crash-looping: back off hard.
+  if [ "$dur" -lt 3 ]; then
+    fails=$((fails + 1))
+  else
+    fails=0
+  fi
+
+  wlog "daemon exited rc=$rc after ${dur}s (consecutive quick exits=$fails)"
+
+  case "$fails" in
+    0|1|2) sleep 3 ;;
+    3|4|5) sleep 20 ;;
+    *)     sleep 300 ;;
+  esac
+done

@@ -1,0 +1,7 @@
+id=dsh_bridge
+name=DSH Bridge
+version=v1.9.0
+versionCode=16
+author=dsh-go
+description=给 dsh-go 一条只对它生效的提权通道：dshroot 一次性执行（并发、可找回结果）+ dshtty 持久会话。守护进程带 supervisor 自愈；心跳停了「执行/重连」会自动判定卡死并重启，启动后核对真实心跳才算成功。不挂载 system，目录与进程名不含 root 字样，空闲退避。
+updateJson=https://raw.githubusercontent.com/ishoehsj/dsh-rootbridge/main/update.json
